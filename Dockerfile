@@ -14,24 +14,20 @@ ARG QWEN_MODEL_DIR=/models/qwen2.5-1.5b-instruct
 RUN python3 - <<PY
 from pathlib import Path
 
-from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
+from huggingface_hub import snapshot_download
 
-model_repo = "${MODEL_REPO}"
-model_dir = Path("${MODEL_DIR}")
-qwen_model_repo = "${QWEN_MODEL_REPO}"
-qwen_model_dir = Path("${QWEN_MODEL_DIR}")
-model_dir.mkdir(parents=True, exist_ok=True)
-qwen_model_dir.mkdir(parents=True, exist_ok=True)
 
-classifier_tokenizer = AutoTokenizer.from_pretrained(model_repo)
-classifier_model = AutoModelForSequenceClassification.from_pretrained(model_repo)
-classifier_tokenizer.save_pretrained(model_dir)
-classifier_model.save_pretrained(model_dir)
+def download_snapshot(repo_id: str, target_dir: str) -> None:
+    path = Path(target_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=str(path),
+    )
 
-qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_model_repo)
-qwen_model = AutoModelForCausalLM.from_pretrained(qwen_model_repo)
-qwen_tokenizer.save_pretrained(qwen_model_dir)
-qwen_model.save_pretrained(qwen_model_dir)
+
+download_snapshot("${MODEL_REPO}", "${MODEL_DIR}")
+download_snapshot("${QWEN_MODEL_REPO}", "${QWEN_MODEL_DIR}")
 PY
 
 RUN rm -rf /root/.cache/huggingface
