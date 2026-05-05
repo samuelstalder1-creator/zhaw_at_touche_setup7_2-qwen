@@ -1,228 +1,163 @@
 # setup7_2-qwen Code Submission
 
-This directory is a self-contained TIRA code submission for the
-`advertisement-in-retrieval-augmented-generation-2026` task. The container
-entrypoint is `/predict.py`. At runtime it loads the bundled Longformer
-sequence-classification model from `/models/setup7_2-qwen`, consumes the input
-`qwen` neutral reference directly, and writes `predictions.jsonl`.
+This submission now runs the full Qwen-plus-Longformer inference pipeline for
+`advertisement-in-retrieval-augmented-generation-2026`:
 
-This is a classifier-only submission. It does not run Qwen chat generation at
-inference time.
+1. load the bundled `Qwen/Qwen2.5-1.5B-Instruct` generator
+2. generate a neutral response from the input `query` when `qwen` is missing
+3. build the Longformer prompt from `query + qwen + response`
+4. classify with the bundled `setup7_2-qwen` Longformer model
 
-## Submission Package Contents
+The runtime entrypoint is `/predict.py`. It writes `predictions.jsonl` in TIRA
+format.
 
-The package contains these files:
+## Package Contents
 
-- `predict.py`: runtime inference entrypoint used by TIRA
-- `Dockerfile`: image definition used by `tira-cli code-submission`
-- `requirements.txt`: Python dependencies installed into the container
-- `.dockerignore`: excludes local caches and outputs from the image context
-- `tools/docker`: optional Docker wrapper for `tira-cli` compatibility
-- `README.md`: submission specification and operator notes
+- `predict.py`: runtime inference entrypoint
+- `Dockerfile`: container build for TIRA
+- `requirements.txt`: Python dependencies
+- `tools/docker`: optional Docker wrapper for local `tira-cli` workflows
+- `README.md`: operator notes
 
-The image preloads the published Hugging Face model
-`sambus211/zhaw_at_touche_setup7_2_qwen` during Docker build and saves it as a
-local bundle in `/models/setup7_2-qwen`, so the final TIRA runtime stays
-offline.
+During Docker build the image stores two local model bundles so runtime stays
+offline:
+
+- classifier: `/models/setup7_2-qwen`
+- generator: `/models/qwen2.5-1.5b-instruct`
 
 ## Runtime Contract
 
-TIRA will execute the submission with:
+TIRA executes:
 
 ```bash
 /predict.py
 ```
 
-The runner supports both direct CLI usage and the standard TIRA environment
-variables:
+Supported inputs:
 
-- `inputDataset`: dynamic input directory mounted by TIRA
-- `outputDir`: dynamic output directory mounted by TIRA
-
-Equivalent CLI flags are also supported:
-
-- `--dataset`: TIRA dataset id, local directory, or local JSONL file
-- `--input-directory`: explicit local or mounted input directory
+- `inputDataset`: TIRA input directory
+- `outputDir`: TIRA output directory
+- `--dataset`: TIRA dataset id, local directory, or JSONL file
+- `--input-directory`: explicit local input directory
 - `--output-directory`: explicit output directory
-- `--output`: explicit output file path
+- `--output`: explicit prediction file
 
-If the input is a directory, `predict.py` automatically discovers the most
-likely JSONL file whose rows contain `id`, `query`, `response`, and `qwen`.
+If the input is a directory, `predict.py` discovers the most likely JSONL file
+whose rows contain at least `id`, `query`, and `response`.
 
 ## Input Specification
 
-Each input row must be a JSON object with at least these fields:
+Each row must contain:
 
-- `id`: unique row identifier
-- `query`: user query string
-- `response`: generated answer to classify
-- `qwen`: neutral Qwen reference for the same query
+- `id`
+- `query`
+- `response`
 
-Example row:
+Optional:
+
+- `qwen`: precomputed neutral response for the same query
+
+Example raw input row:
 
 ```json
-{"id":"example-1","query":"What is the best way to compare CRM pricing?","response":"HubSpot offers flexible pricing tiers and powerful automation tools for growing teams.","qwen":"Comparing CRM pricing usually involves checking subscription tiers, user limits, included features, support options, and any additional implementation or usage costs."}
+{"id":"example-1","query":"What is the best way to compare CRM pricing?","response":"HubSpot offers flexible pricing tiers and powerful automation tools for growing teams."}
 ```
 
-The model input text is built exactly like this:
+If `qwen` is missing or empty, the submission generates it with the bundled
+Qwen model. If `qwen` is already present, it is reused by default. Disable that
+with `--no-reuse-existing-neutral`.
+
+The classifier input is built exactly as:
 
 ```text
 USER QUERY: <query>
 
-NEUTRAL REFERENCE (QWEN): <qwen>
+NEUTRAL REFERENCE (QWEN): <generated_or_existing_qwen>
 
 RESPONSE TO CLASSIFY: <response>
 
 LABEL THIS AS AD OR NEUTRAL:
 ```
 
-If `qwen` is missing or empty, the submission fails fast. It does not generate
-fallback neutrals.
-
 ## Output Specification
 
-The submission writes one file:
-
-```text
-predictions.jsonl
-```
-
-Default location under TIRA:
+The submission writes:
 
 ```text
 $outputDir/predictions.jsonl
 ```
 
-Each output row is a JSON object like:
+Each row is:
 
 ```json
 {"id":"example-1","label":1,"ad_prob":0.9973}
 ```
 
-Field semantics:
-
-- `id`: copied from the input row
-- `label`: binary integer prediction in `{0, 1}`
+- `id`: copied from input
+- `label`: binary prediction in `{0, 1}`
 - `ad_prob`: `softmax(logits)[1]`
 
-The output row order follows the input row order.
+## Defaults
 
-## Model And Inference Defaults
+- classifier dir: `/models/setup7_2-qwen`
+- generator dir: `/models/qwen2.5-1.5b-instruct`
+- generator source model: `Qwen/Qwen2.5-1.5B-Instruct`
+- classifier max length: `1024`
+- classifier batch size: `4`
+- generator max new tokens: `220`
+- threshold: `0.5`
+- device order: `cuda`, then `mps`, then `cpu`
 
-- Hugging Face source: `sambus211/zhaw_at_touche_setup7_2_qwen`
-- Bundled local model dir: `/models/setup7_2-qwen`
-- Architecture: Longformer sequence classifier
-- Input format: `query_neutral_response`
-- Reference field: `qwen`
-- Reference label: `QWEN`
-- Default batch size: `4`
-- Default max length: `1024`
-- Padding mode: `padding="max_length"`
-- Default threshold: `0.5`
-- Default device selection: `cuda`, then `mps`, then `cpu`
-
-Override values if needed:
+CLI override example:
 
 ```bash
 ./predict.py \
-  --dataset ../zhaw_at_touche/data/generated/qwen/responses-validation-with-neutral_qwen.jsonl \
-  --output ./out/predictions.jsonl \
+  --dataset ../zhaw_at_touche/data/task/responses-validation.jsonl \
   --model-dir /absolute/path/to/setup7_2-qwen \
-  --batch-size 4 \
-  --max-length 1024 \
-  --threshold 0.5 \
+  --qwen-model Qwen/Qwen2.5-1.5B-Instruct \
+  --output ./out/predictions.jsonl \
   --device cpu
 ```
 
 ## Local Verification
 
-For direct host-side runs, make sure you already have a local exported model
-bundle and point `--model-dir` at it. If you do not, prefer the Docker dry-run
-validation below because the container build creates `/models/setup7_2-qwen`
-for you.
+Run directly on raw task data:
 
-Run on a local Qwen-enriched JSONL file:
+```bash
+./predict.py \
+  --dataset ../zhaw_at_touche/data/task/responses-validation.jsonl \
+  --model-dir /absolute/path/to/setup7_2-qwen \
+  --qwen-model Qwen/Qwen2.5-1.5B-Instruct \
+  --output ./out/predictions.jsonl
+```
+
+Run on already enriched data and reuse the existing `qwen` field:
 
 ```bash
 ./predict.py \
   --dataset ../zhaw_at_touche/data/generated/qwen/responses-validation-with-neutral_qwen.jsonl \
   --model-dir /absolute/path/to/setup7_2-qwen \
+  --qwen-model Qwen/Qwen2.5-1.5B-Instruct \
   --output ./out/predictions.jsonl
 ```
 
-Or run against a TIRA dataset id through the TIRA Python client:
+TIRA-style environment variables also work:
 
 ```bash
-./predict.py \
-  --dataset advertisement-in-retrieval-augmented-generation-2026/ads-in-rag-task-1-detection-spot-check-20260422-training \
+inputDataset=../zhaw_at_touche/data/task outputDir=./out ./predict.py \
   --model-dir /absolute/path/to/setup7_2-qwen \
-  --output ./out/predictions.jsonl
+  --qwen-model Qwen/Qwen2.5-1.5B-Instruct
 ```
 
-The TIRA-style environment variables also work directly:
+## Docker Validation
+
+Build locally:
 
 ```bash
-inputDataset=../zhaw_at_touche/data/generated/qwen outputDir=./out ./predict.py \
-  --model-dir /absolute/path/to/setup7_2-qwen
+docker build -t zhaw-at-touche-setup7-2-qwen-local .
 ```
 
-If you point the submission at a raw task directory that does not already
-contain a `qwen` field, it will fail by design.
-
-## Validate The Docker Submission
-
-Use this section before uploading to TIRA to validate that the Dockerized
-submission behaves like a real TIRA run.
-
-### Prerequisites
-
-- Docker is installed and running
-- `tira` is installed: `pip3 install tira`
-- you are registered for the task in TIRA
-- for real uploads, the git repository is clean: `git status`
-
-Authenticate and verify the local TIRA client:
-
-```bash
-tira-cli login --token <YOUR_TIRA_TOKEN>
-tira-cli verify-installation --task advertisement-in-retrieval-augmented-generation-2026
-```
-
-If you use Docker Desktop with the containerd image store enabled, TIRA may
-reject uploaded images even though the local build and push succeed. In that
-case, force Docker v2 manifest output during submission:
-
-```bash
-tira-cli code-submission \
-  --path . \
-  --task advertisement-in-retrieval-augmented-generation-2026 \
-  --dataset ads-in-rag-task-1-detection-spot-check-20260422-training \
-  --command '/predict.py' \
-  --build-args '--output type=docker --provenance=false'
-```
-
-If Docker still exports an incompatible image, disable Docker Desktop's
-`Use containerd for pulling and storing images` setting, rebuild, and retry the
-submission.
-
-If the failure happens before your submission image is built, `tira-cli` may be
-rejecting its own internal `tira-mini` preflight image before the build args
-above are applied. In that case, prepend the repo-local Docker wrapper so every
-`docker build` invoked by `tira-cli` gets the compatibility flags:
-
-```bash
-PATH="${PWD}/tools:${PATH}" tira-cli code-submission \
-  --path . \
-  --task advertisement-in-retrieval-augmented-generation-2026 \
-  --dataset ads-in-rag-task-1-detection-spot-check-20260422-training \
-  --command '/predict.py'
-```
-
-### TIRA Dry-Run Validation
-
-This is the closest local validation to a real TIRA code submission. It builds
-the Docker image from this directory and runs the submission on the specified
-dataset without uploading anything.
+Dry-run the submission with `tira-cli`:
 
 ```bash
 tira-cli code-submission \
@@ -233,35 +168,13 @@ tira-cli code-submission \
   --command '/predict.py'
 ```
 
-What this validates:
-
-- the Docker image builds successfully
-- `/predict.py` starts correctly inside the container
-- the runtime can read `$inputDataset`
-- the runtime writes a valid JSONL prediction file to `$outputDir`
-- the output format is acceptable for the task
-
-### Optional Local Sandbox Test With `tira-run`
-
-Build the image:
-
-```bash
-docker build -t zhaw-at-touche-setup7-2-qwen-local .
-```
-
-Run the image with TIRA-style directory mounts:
+Or run the built image with `tira-run`:
 
 ```bash
 mkdir -p ./tira-output
 tira-run \
-  --input-directory ../zhaw_at_touche/data/generated/qwen \
+  --input-directory ../zhaw_at_touche/data/task \
   --output-directory ./tira-output \
   --image zhaw-at-touche-setup7-2-qwen-local \
   --command /predict.py
-```
-
-The resulting file will be:
-
-```text
-./tira-output/predictions.jsonl
 ```

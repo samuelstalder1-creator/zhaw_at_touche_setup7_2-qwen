@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
+import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,14 +14,41 @@ from typing import Any
 import torch
 from tira.rest_api_client import Client
 from tira.third_party_integrations import get_output_directory
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 
 DEFAULT_MODEL_DIR = Path("/models/setup7_2-qwen")
+DEFAULT_QWEN_MODEL_REPO = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_QWEN_MODEL_DIR = Path("/models/qwen2.5-1.5b-instruct")
 REFERENCE_FIELD = "qwen"
 REFERENCE_LABEL = "QWEN"
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_MAX_LENGTH = 1024
+DEFAULT_CPU_BATCH_SIZE = 1
+DEFAULT_CPU_MAX_LENGTH = 512
+DEFAULT_MAX_NEW_TOKENS = 220
 DEFAULT_THRESHOLD = 0.5
+UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+LIST_PREFIX_RE = re.compile(r"^\s*(?:[•◦▪●‣∙]|[-*+]|(?:\d+|[a-zA-Z])[.)])\s+")
+
+SYSTEM_PROMPT = """Goal:
+Write a helpful, factual answer to the user's query that matches the style of existing neutral responses.
+
+Rules:
+- Do not mention brand names, companies, vendors, product models, or specific services.
+- Do not promote or recommend a specific item.
+- Avoid marketing language, persuasion, links, or calls to action.
+- Generic product or technical terms are allowed.
+
+Style Requirements:
+- Write in flowing prose using natural sentences and short paragraphs.
+- Do not use bullet points, numbered lists, section headers, or markdown list formatting.
+- Keep tone factual, balanced, and conversational.
+- Return exactly one continuous paragraph.
+- Do not output any newline characters.
+
+Length:
+- Target roughly 130-200 words unless the query is trivial.
+"""
 
 
 @dataclass(frozen=True)
@@ -52,6 +81,40 @@ def autocast_context(device: str):
     if device == "cuda" and torch.cuda.is_bf16_supported():
         return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
+
+
+def clean_response_text(text: str) -> str:
+    cleaned = text.strip()
+    cleaned = UNICODE_ESCAPE_RE.sub(lambda match: chr(int(match.group(1), 16)), cleaned)
+    cleaned = cleaned.replace("\\n", "\n")
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = cleaned.replace("\t", " ")
+
+    paragraphs: list[str] = []
+    current_lines: list[str] = []
+    for raw_line in cleaned.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            if current_lines:
+                paragraphs.append(" ".join(current_lines).strip())
+                current_lines = []
+            continue
+        line = LIST_PREFIX_RE.sub("", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            current_lines.append(line)
+
+    if current_lines:
+        paragraphs.append(" ".join(current_lines).strip())
+
+    return re.sub(r"\s+", " ", " ".join(paragraphs).strip())
+
+
+def build_chat_messages(query: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": query.strip()},
+    ]
 
 
 def build_model_input(record: dict[str, Any]) -> str:
@@ -88,7 +151,7 @@ def first_jsonl_row(path: Path) -> dict[str, Any] | None:
 
 
 def input_candidate_score(path: Path, row: dict[str, Any]) -> tuple[int, int, str] | None:
-    if "id" not in row or "query" not in row or "response" not in row or REFERENCE_FIELD not in row:
+    if "id" not in row or "query" not in row or "response" not in row:
         return None
 
     name = path.name.lower()
@@ -136,8 +199,8 @@ def discover_input_file(input_path: Path) -> Path:
 
     if not candidates:
         raise FileNotFoundError(
-            f"Could not find a Qwen-enriched response JSONL file under {input_path}. "
-            f"Expected rows with at least 'id', 'query', 'response', and '{REFERENCE_FIELD}' fields."
+            f"Could not find a response JSONL file under {input_path}. "
+            "Expected rows with at least 'id', 'query', and 'response' fields."
         )
 
     candidates.sort(key=lambda item: item[0], reverse=True)
@@ -148,7 +211,6 @@ def validate_record(row: dict[str, Any], *, origin: str) -> dict[str, Any]:
     row_id = row.get("id")
     query = row.get("query")
     response = row.get("response")
-    neutral = row.get(REFERENCE_FIELD)
 
     if not isinstance(row_id, str) or not row_id.strip():
         raise ValueError(f"{origin} is missing a valid 'id'.")
@@ -156,8 +218,6 @@ def validate_record(row: dict[str, Any], *, origin: str) -> dict[str, Any]:
         raise ValueError(f"{origin} is missing a valid 'query'.")
     if not isinstance(response, str) or not response.strip():
         raise ValueError(f"{origin} is missing a valid 'response'.")
-    if not isinstance(neutral, str) or not neutral.strip():
-        raise ValueError(f"{origin} is missing a valid '{REFERENCE_FIELD}'.")
 
     return row
 
@@ -200,6 +260,46 @@ def load_records_from_source(input_source: str) -> tuple[list[dict[str, Any]], s
     return load_tira_dataset_records(input_source), input_source
 
 
+def load_local_generation_model(model_name: str, device: str):
+    resolved_model_name = model_name
+    if model_name == str(DEFAULT_QWEN_MODEL_DIR) and not DEFAULT_QWEN_MODEL_DIR.exists():
+        resolved_model_name = DEFAULT_QWEN_MODEL_REPO
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(resolved_model_name, local_files_only=True)
+        if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        model_kwargs: dict[str, Any] = {}
+        if device == "cuda":
+            if torch.cuda.is_bf16_supported():
+                model_kwargs["torch_dtype"] = torch.bfloat16
+            else:
+                model_kwargs["torch_dtype"] = torch.float16
+
+        model = AutoModelForCausalLM.from_pretrained(
+            resolved_model_name,
+            local_files_only=True,
+            **model_kwargs,
+        ).to(device)
+    except OSError:
+        tokenizer = AutoTokenizer.from_pretrained(resolved_model_name)
+        if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        model_kwargs = {}
+        if device == "cuda":
+            if torch.cuda.is_bf16_supported():
+                model_kwargs["torch_dtype"] = torch.bfloat16
+            else:
+                model_kwargs["torch_dtype"] = torch.float16
+
+        model = AutoModelForCausalLM.from_pretrained(resolved_model_name, **model_kwargs).to(device)
+
+    model.eval()
+    return tokenizer, model
+
+
 def load_model(model_dir: Path, device: str):
     if not model_dir.exists():
         raise FileNotFoundError(f"Bundled model directory not found: {model_dir}")
@@ -211,6 +311,98 @@ def load_model(model_dir: Path, device: str):
     ).to(device)
     model.eval()
     return tokenizer, model
+
+
+def generate_neutral_response(
+    *,
+    tokenizer,
+    model,
+    query: str,
+    device: str,
+    max_new_tokens: int,
+) -> str:
+    if not hasattr(tokenizer, "apply_chat_template"):
+        raise RuntimeError("Tokenizer does not support chat templates for local Qwen generation.")
+
+    prompt_text = tokenizer.apply_chat_template(
+        build_chat_messages(query),
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    tokenized = tokenizer(prompt_text, return_tensors="pt")
+    inputs = {key: value.to(device) for key, value in tokenized.items()}
+    input_length = int(inputs["input_ids"].shape[-1])
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=model.dtype)
+        if device == "cuda" and isinstance(model.dtype, torch.dtype)
+        else nullcontext()
+    )
+    with torch.inference_mode():
+        with autocast_ctx:
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+    generated_ids = generated[:, input_length:]
+    text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    if not text:
+        raise RuntimeError("Empty neutral response from local Qwen generation.")
+    return clean_response_text(text)
+
+
+def maybe_generate_neutrals(
+    *,
+    records: list[dict[str, Any]],
+    qwen_tokenizer,
+    qwen_model,
+    qwen_device: str,
+    max_new_tokens: int,
+    reuse_existing_neutral: bool,
+) -> tuple[list[dict[str, Any]], int]:
+    enriched_records: list[dict[str, Any]] = []
+    query_cache: dict[str, str] = {}
+    generated_queries = 0
+
+    for record in records:
+        out = dict(record)
+        existing = out.get(REFERENCE_FIELD)
+        if reuse_existing_neutral and isinstance(existing, str) and existing.strip():
+            enriched_records.append(out)
+            continue
+
+        query = out.get("query", "")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError(f"Record {out.get('id', '<unknown>')} is missing a valid 'query' field.")
+
+        neutral = query_cache.get(query)
+        if neutral is None:
+            neutral = generate_neutral_response(
+                tokenizer=qwen_tokenizer,
+                model=qwen_model,
+                query=query,
+                device=qwen_device,
+                max_new_tokens=max_new_tokens,
+            )
+            query_cache[query] = neutral
+            generated_queries += 1
+
+        out[REFERENCE_FIELD] = neutral
+        enriched_records.append(out)
+
+    return enriched_records, generated_queries
+
+
+def needs_neutral_generation(records: list[dict[str, Any]], *, reuse_existing_neutral: bool) -> bool:
+    if not reuse_existing_neutral:
+        return True
+    return any(
+        not isinstance(record.get(REFERENCE_FIELD), str)
+        or not str(record.get(REFERENCE_FIELD, "")).strip()
+        for record in records
+    )
 
 
 def predict_records(
@@ -282,9 +474,20 @@ def resolve_output_file(args: argparse.Namespace) -> Path:
     return Path(get_output_directory(str(Path(__file__).parent))) / "predictions.jsonl"
 
 
+def tune_runtime_settings(args: argparse.Namespace, device: str) -> None:
+    if device == "cuda":
+        return
+
+    if args.batch_size == DEFAULT_BATCH_SIZE:
+        args.batch_size = DEFAULT_CPU_BATCH_SIZE
+
+    if args.max_length == DEFAULT_MAX_LENGTH:
+        args.max_length = DEFAULT_CPU_MAX_LENGTH
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the setup7_2-qwen Longformer TIRA submission on a TIRA dataset id or local input directory."
+        description="Run the setup7_2-qwen TIRA submission: generate or reuse Qwen neutrals, then classify with the bundled Longformer model."
     )
     parser.add_argument(
         "--dataset",
@@ -313,9 +516,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_MODEL_DIR),
         help="Local bundled Hugging Face sequence-classification model directory.",
     )
+    parser.add_argument(
+        "--qwen-model",
+        default=str(DEFAULT_QWEN_MODEL_DIR),
+        help="Local or remote Qwen generator model identifier.",
+    )
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
+    parser.add_argument("--qwen-max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument(
+        "--reuse-existing-neutral",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse an existing 'qwen' field in the input if present; otherwise generate it locally.",
+    )
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"), default=None)
     return parser
 
@@ -323,10 +538,30 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     input_source = resolve_input_source(args)
-    records, input_description = load_records_from_source(input_source)
+    raw_records, input_description = load_records_from_source(input_source)
     output_file = resolve_output_file(args)
 
     device = resolve_device(args.device)
+    tune_runtime_settings(args, device)
+
+    records = raw_records
+    generated_queries = 0
+    if needs_neutral_generation(raw_records, reuse_existing_neutral=args.reuse_existing_neutral):
+        qwen_tokenizer, qwen_model = load_local_generation_model(args.qwen_model, device)
+        records, generated_queries = maybe_generate_neutrals(
+            records=raw_records,
+            qwen_tokenizer=qwen_tokenizer,
+            qwen_model=qwen_model,
+            qwen_device=device,
+            max_new_tokens=args.qwen_max_new_tokens,
+            reuse_existing_neutral=args.reuse_existing_neutral,
+        )
+        del qwen_model
+        del qwen_tokenizer
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
     tokenizer, model = load_model(Path(args.model_dir), device)
     predictions = predict_records(
         records=records,
@@ -343,6 +578,8 @@ def main() -> None:
     print(f"rows={len(records)}")
     print(f"output_file={output_file}")
     print(f"model_dir={args.model_dir}")
+    print(f"qwen_model={args.qwen_model}")
+    print(f"generated_qwen_neutrals={generated_queries}")
 
 
 if __name__ == "__main__":
