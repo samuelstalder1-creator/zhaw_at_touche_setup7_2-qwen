@@ -151,7 +151,17 @@ def first_jsonl_row(path: Path) -> dict[str, Any] | None:
     return None
 
 
-def input_candidate_score(path: Path, row: dict[str, Any]) -> tuple[int, int, str] | None:
+def has_non_empty_text_field(row: dict[str, Any], field_name: str) -> bool:
+    value = row.get(field_name)
+    return isinstance(value, str) and bool(value.strip())
+
+
+def input_candidate_score(
+    path: Path,
+    row: dict[str, Any],
+    *,
+    prefer_reference_field: str | None = None,
+) -> tuple[int, int, str] | None:
     if "id" not in row or "query" not in row or "response" not in row:
         return None
 
@@ -178,10 +188,19 @@ def input_candidate_score(path: Path, row: dict[str, Any]) -> tuple[int, int, st
     else:
         score = 50
 
+    # For reference-aware setups, prefer already enriched files over raw task
+    # files so runtime matches the local validation condition whenever possible.
+    if prefer_reference_field and has_non_empty_text_field(row, prefer_reference_field):
+        score += 1000
+        if prefer_reference_field in name:
+            score += 20
+        if "neutral" in name:
+            score += 10
+
     return score, -len(path.parts), str(path)
 
 
-def discover_input_file(input_path: Path) -> Path:
+def discover_input_file(input_path: Path, *, prefer_reference_field: str | None = None) -> Path:
     if input_path.is_file():
         return input_path
     if not input_path.exists():
@@ -194,7 +213,7 @@ def discover_input_file(input_path: Path) -> Path:
         row = first_jsonl_row(path)
         if row is None:
             continue
-        score = input_candidate_score(path, row)
+        score = input_candidate_score(path, row, prefer_reference_field=prefer_reference_field)
         if score is not None:
             candidates.append((score, path))
 
@@ -252,10 +271,14 @@ def load_tira_dataset_records(dataset: str) -> list[dict[str, Any]]:
     return normalized_records
 
 
-def load_records_from_source(input_source: str) -> tuple[list[dict[str, Any]], str]:
+def load_records_from_source(
+    input_source: str,
+    *,
+    prefer_reference_field: str | None = None,
+) -> tuple[list[dict[str, Any]], str]:
     input_path = Path(input_source)
     if input_path.exists():
-        input_file = discover_input_file(input_path)
+        input_file = discover_input_file(input_path, prefer_reference_field=prefer_reference_field)
         return load_records(input_file), str(input_file)
 
     return load_tira_dataset_records(input_source), input_source
@@ -541,7 +564,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     input_source = resolve_input_source(args)
-    raw_records, input_description = load_records_from_source(input_source)
+    preferred_reference_field = REFERENCE_FIELD if args.reuse_existing_neutral else None
+    raw_records, input_description = load_records_from_source(
+        input_source,
+        prefer_reference_field=preferred_reference_field,
+    )
     output_file = resolve_output_file(args)
 
     device = resolve_device(args.device)

@@ -44,7 +44,11 @@ Supported inputs:
 - `--tag`: optional submission tag written to each prediction row
 
 If the input is a directory, `predict.py` discovers the most likely JSONL file
-whose rows contain at least `id`, `query`, and `response`.
+whose rows contain at least `id`, `query`, and `response`. When
+`--reuse-existing-neutral` is enabled and the directory contains both raw task
+files and Qwen-enriched JSONL files, it prefers the file that already contains
+the `qwen` field so the runtime reuses the pre-generated neutral responses
+instead of regenerating them.
 
 ## Input Specification
 
@@ -65,8 +69,9 @@ Example raw input row:
 ```
 
 If `qwen` is missing or empty, the submission generates it with the bundled
-Qwen model. If `qwen` is already present, it is reused by default. Disable that
-with `--no-reuse-existing-neutral`.
+Qwen model. If `qwen` is already present, it is reused by default. When a
+directory contains both raw and enriched files, the enriched file is preferred
+for the same reason. Disable reuse with `--no-reuse-existing-neutral`.
 
 The classifier input is built exactly as:
 
