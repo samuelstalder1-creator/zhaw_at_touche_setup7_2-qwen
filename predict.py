@@ -21,6 +21,7 @@ DEFAULT_QWEN_MODEL_REPO = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_QWEN_MODEL_DIR = Path("/models/qwen2.5-1.5b-instruct")
 REFERENCE_FIELD = "qwen"
 REFERENCE_LABEL = "QWEN"
+DEFAULT_TAG = "zhawAtToucheSetup72Qwen"
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_MAX_LENGTH = 1024
 DEFAULT_CPU_BATCH_SIZE = 1
@@ -445,6 +446,7 @@ def write_predictions(
     records: list[dict[str, Any]],
     predictions: list[Prediction],
     output_file: Path,
+    tag: str,
 ) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with output_file.open("w", encoding="utf-8") as handle:
@@ -452,7 +454,7 @@ def write_predictions(
             row = {
                 "id": record["id"],
                 "label": prediction.label,
-                "ad_prob": prediction.ad_prob,
+                "tag": tag,
             }
             handle.write(json.dumps(row) + "\n")
 
@@ -521,6 +523,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_QWEN_MODEL_DIR),
         help="Local or remote Qwen generator model identifier.",
     )
+    parser.add_argument("--tag", default=DEFAULT_TAG)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
@@ -572,13 +575,14 @@ def main() -> None:
         max_length=args.max_length,
         threshold=args.threshold,
     )
-    write_predictions(records=records, predictions=predictions, output_file=output_file)
+    write_predictions(records=records, predictions=predictions, output_file=output_file, tag=args.tag)
 
     print(f"input_source={input_description}")
     print(f"rows={len(records)}")
     print(f"output_file={output_file}")
     print(f"model_dir={args.model_dir}")
     print(f"qwen_model={args.qwen_model}")
+    print(f"tag={args.tag}")
     print(f"generated_qwen_neutrals={generated_queries}")
 
 

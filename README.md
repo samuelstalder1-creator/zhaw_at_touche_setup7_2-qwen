@@ -41,6 +41,7 @@ Supported inputs:
 - `--input-directory`: explicit local input directory
 - `--output-directory`: explicit output directory
 - `--output`: explicit prediction file
+- `--tag`: optional submission tag written to each prediction row
 
 If the input is a directory, `predict.py` discovers the most likely JSONL file
 whose rows contain at least `id`, `query`, and `response`.
@@ -90,12 +91,12 @@ $outputDir/predictions.jsonl
 Each row is:
 
 ```json
-{"id":"example-1","label":1,"ad_prob":0.9973}
+{"id":"example-1","label":1,"tag":"zhawAtToucheSetup72Qwen"}
 ```
 
 - `id`: copied from input
 - `label`: binary prediction in `{0, 1}`
-- `ad_prob`: `softmax(logits)[1]`
+- `tag`: submission identifier, defaulting to `zhawAtToucheSetup72Qwen`
 
 ## Defaults
 
@@ -105,6 +106,7 @@ Each row is:
 - classifier max length: `1024`
 - classifier batch size: `4`
 - generator max new tokens: `220`
+- output tag: `zhawAtToucheSetup72Qwen`
 - threshold: `0.5`
 - device order: `cuda`, then `mps`, then `cpu`
 
