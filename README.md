@@ -106,8 +106,8 @@ Each row is:
 ## Defaults
 
 - classifier dir: `/models/setup7_2-qwen`
-- generator dir: `/models/qwen2.5-1.5b-instruct`
-- generator source model: `Qwen/Qwen2.5-1.5B-Instruct`
+- generator dir / default `--qwen-model`: `/models/qwen2.5-1.5b-instruct`
+- generator fallback source model: `Qwen/Qwen2.5-1.5B-Instruct`
 - classifier max length: `1024`
 - classifier batch size: `4`
 - generator max new tokens: `220`

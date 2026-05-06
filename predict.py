@@ -17,7 +17,9 @@ from tira.third_party_integrations import get_output_directory
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 
 DEFAULT_MODEL_DIR = Path("/models/setup7_2-qwen")
-DEFAULT_QWEN_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_QWEN_MODEL_DIR = Path("/models/qwen2.5-1.5b-instruct")
+DEFAULT_QWEN_MODEL_REPO = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_QWEN_MODEL_NAME = str(DEFAULT_QWEN_MODEL_DIR)
 REFERENCE_FIELD = "qwen"
 REFERENCE_LABEL = "QWEN"
 DEFAULT_TAG = "zhawAtToucheSetup72Qwen"
@@ -284,36 +286,30 @@ def load_records_from_source(
 
 
 def load_local_generation_model(model_name: str, device: str):
+    model_kwargs: dict[str, Any] = {}
+    if device == "cuda":
+        if torch.cuda.is_bf16_supported():
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        else:
+            model_kwargs["torch_dtype"] = torch.float16
+
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
         if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
-
-        model_kwargs: dict[str, Any] = {}
-        if device == "cuda":
-            if torch.cuda.is_bf16_supported():
-                model_kwargs["torch_dtype"] = torch.bfloat16
-            else:
-                model_kwargs["torch_dtype"] = torch.float16
 
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             local_files_only=True,
             **model_kwargs,
         ).to(device)
-    except OSError:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    except (OSError, ValueError):
+        fallback_model_name = DEFAULT_QWEN_MODEL_REPO if model_name == DEFAULT_QWEN_MODEL_NAME else model_name
+        tokenizer = AutoTokenizer.from_pretrained(fallback_model_name)
         if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        model_kwargs = {}
-        if device == "cuda":
-            if torch.cuda.is_bf16_supported():
-                model_kwargs["torch_dtype"] = torch.bfloat16
-            else:
-                model_kwargs["torch_dtype"] = torch.float16
-
-        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs).to(device)
+        model = AutoModelForCausalLM.from_pretrained(fallback_model_name, **model_kwargs).to(device)
 
     model.eval()
     return tokenizer, model
