@@ -9,12 +9,12 @@ RUN pip3 uninstall -y torchvision
 ARG MODEL_REPO=sambus211/zhaw_at_touche_setup7_2_qwen
 ARG MODEL_DIR=/models/setup7_2-qwen
 ARG QWEN_MODEL_REPO=Qwen/Qwen2.5-1.5B-Instruct
-ARG QWEN_MODEL_DIR=/models/qwen2.5-1.5b-instruct
 
 RUN python3 - <<PY
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def download_snapshot(repo_id: str, target_dir: str) -> None:
@@ -27,9 +27,8 @@ def download_snapshot(repo_id: str, target_dir: str) -> None:
 
 
 download_snapshot("${MODEL_REPO}", "${MODEL_DIR}")
-download_snapshot("${QWEN_MODEL_REPO}", "${QWEN_MODEL_DIR}")
+AutoTokenizer.from_pretrained("${QWEN_MODEL_REPO}")
+AutoModelForCausalLM.from_pretrained("${QWEN_MODEL_REPO}")
 PY
-
-RUN rm -rf /root/.cache/huggingface
 
 ENTRYPOINT ["python3", "/predict.py"]

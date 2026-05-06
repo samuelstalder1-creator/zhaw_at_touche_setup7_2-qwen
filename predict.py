@@ -17,8 +17,7 @@ from tira.third_party_integrations import get_output_directory
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 
 DEFAULT_MODEL_DIR = Path("/models/setup7_2-qwen")
-DEFAULT_QWEN_MODEL_REPO = "Qwen/Qwen2.5-1.5B-Instruct"
-DEFAULT_QWEN_MODEL_DIR = Path("/models/qwen2.5-1.5b-instruct")
+DEFAULT_QWEN_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 REFERENCE_FIELD = "qwen"
 REFERENCE_LABEL = "QWEN"
 DEFAULT_TAG = "zhawAtToucheSetup72Qwen"
@@ -285,12 +284,8 @@ def load_records_from_source(
 
 
 def load_local_generation_model(model_name: str, device: str):
-    resolved_model_name = model_name
-    if model_name == str(DEFAULT_QWEN_MODEL_DIR) and not DEFAULT_QWEN_MODEL_DIR.exists():
-        resolved_model_name = DEFAULT_QWEN_MODEL_REPO
-
     try:
-        tokenizer = AutoTokenizer.from_pretrained(resolved_model_name, local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
         if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -302,12 +297,12 @@ def load_local_generation_model(model_name: str, device: str):
                 model_kwargs["torch_dtype"] = torch.float16
 
         model = AutoModelForCausalLM.from_pretrained(
-            resolved_model_name,
+            model_name,
             local_files_only=True,
             **model_kwargs,
         ).to(device)
     except OSError:
-        tokenizer = AutoTokenizer.from_pretrained(resolved_model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -318,7 +313,7 @@ def load_local_generation_model(model_name: str, device: str):
             else:
                 model_kwargs["torch_dtype"] = torch.float16
 
-        model = AutoModelForCausalLM.from_pretrained(resolved_model_name, **model_kwargs).to(device)
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs).to(device)
 
     model.eval()
     return tokenizer, model
@@ -447,6 +442,8 @@ def predict_records(
         for start in range(0, len(records), batch_size):
             batch = records[start : start + batch_size]
             texts = [build_model_input(record) for record in batch]
+            for record, text in zip(batch, texts):
+                print(f"[predict] id={record.get('id')} input:\n{text}\n---")
             tokenized = tokenizer(
                 texts,
                 truncation=True,
@@ -458,8 +455,9 @@ def predict_records(
             with autocast_context(device):
                 logits = model(**inputs).logits
             probabilities = torch.softmax(logits, dim=-1)[:, 1].detach().cpu().tolist()
-            for probability in probabilities:
+            for record, probability in zip(batch, probabilities):
                 label = 1 if probability >= threshold else 0
+                print(f"[predict] id={record.get('id')} ad_prob={probability:.4f} label={label}")
                 predictions.append(Prediction(label=label, ad_prob=float(probability)))
     return predictions
 
@@ -499,15 +497,24 @@ def resolve_output_file(args: argparse.Namespace) -> Path:
     return Path(get_output_directory(str(Path(__file__).parent))) / "predictions.jsonl"
 
 
-def tune_runtime_settings(args: argparse.Namespace, device: str) -> None:
+def tune_runtime_settings(
+    *,
+    batch_size: int,
+    max_length: int,
+    device: str,
+    user_batch_size: int | None,
+    user_max_length: int | None,
+) -> tuple[int, int]:
     if device == "cuda":
-        return
+        return batch_size, max_length
 
-    if args.batch_size == DEFAULT_BATCH_SIZE:
-        args.batch_size = DEFAULT_CPU_BATCH_SIZE
+    if user_batch_size is None:
+        batch_size = DEFAULT_CPU_BATCH_SIZE
 
-    if args.max_length == DEFAULT_MAX_LENGTH:
-        args.max_length = DEFAULT_CPU_MAX_LENGTH
+    if user_max_length is None:
+        max_length = min(max_length, DEFAULT_CPU_MAX_LENGTH)
+
+    return batch_size, max_length
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -543,12 +550,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--qwen-model",
-        default=str(DEFAULT_QWEN_MODEL_DIR),
+        default=DEFAULT_QWEN_MODEL_NAME,
         help="Local or remote Qwen generator model identifier.",
     )
     parser.add_argument("--tag", default=DEFAULT_TAG)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size override.")
+    parser.add_argument("--max-length", type=int, default=None, help="Max token length override.")
     parser.add_argument("--qwen-max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument(
@@ -572,7 +579,15 @@ def main() -> None:
     output_file = resolve_output_file(args)
 
     device = resolve_device(args.device)
-    tune_runtime_settings(args, device)
+    batch_size = args.batch_size if args.batch_size is not None else DEFAULT_BATCH_SIZE
+    max_length = args.max_length if args.max_length is not None else DEFAULT_MAX_LENGTH
+    batch_size, max_length = tune_runtime_settings(
+        batch_size=batch_size,
+        max_length=max_length,
+        device=device,
+        user_batch_size=args.batch_size,
+        user_max_length=args.max_length,
+    )
 
     records = raw_records
     generated_queries = 0
@@ -598,8 +613,8 @@ def main() -> None:
         model=model,
         tokenizer=tokenizer,
         device=device,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
+        batch_size=batch_size,
+        max_length=max_length,
         threshold=args.threshold,
     )
     write_predictions(records=records, predictions=predictions, output_file=output_file, tag=args.tag)
